@@ -126,49 +126,46 @@ def setup_authentication():
         host = DATABRICKS_HOST.rstrip("/")
         os.environ["DATABRICKS_HOST"] = host
 
-    # Check if we're running in Databricks Apps with run_as (service principal)
-    # In this case, authentication is automatic - no secrets needed
+    # Databricks Apps may provide both DATABRICKS_TOKEN and DATABRICKS_CLIENT_ID/SECRET.
+    # The SDK raises "more than one authorization method configured" if both are set.
+    has_token = bool(os.getenv("DATABRICKS_TOKEN"))
+    has_oauth = bool(os.getenv("DATABRICKS_CLIENT_ID") and os.getenv("DATABRICKS_CLIENT_SECRET"))
+    if has_token and has_oauth:
+        os.environ.pop("DATABRICKS_CLIENT_ID", None)
+        os.environ.pop("DATABRICKS_CLIENT_SECRET", None)
+
+    # Check if we're running in Databricks notebook
     if os.getenv("DATABRICKS_RUNTIME_VERSION") or os.getenv("DB_IS_DRIVER"):
-        # Running in Databricks - use default authentication
         return WorkspaceClient()
 
-    # Check for existing OAuth credentials in environment
-    if os.getenv("DATABRICKS_CLIENT_ID") and os.getenv("DATABRICKS_CLIENT_SECRET"):
-        return WorkspaceClient(
-            host=os.environ.get("DATABRICKS_HOST"),
-            client_id=os.environ.get("DATABRICKS_CLIENT_ID"),
-            client_secret=os.environ.get("DATABRICKS_CLIENT_SECRET"),
-        )
+    # Use default credential chain (reads env vars automatically)
+    w = WorkspaceClient()
 
-    # Check for PAT token
-    if os.getenv("DATABRICKS_TOKEN"):
-        return WorkspaceClient(
-            host=os.environ.get("DATABRICKS_HOST"),
-            token=os.environ.get("DATABRICKS_TOKEN"),
-        )
+    # Extract a bearer token from the workspace client so that MLflow tracking
+    # can authenticate via the simpler HTTPS+token path instead of the 'databricks'
+    # tracking URI which has known credential resolution issues in Apps environments.
+    try:
+        headers = w.config.authenticate()
+        bearer = headers.get("Authorization", "")
+        if bearer.startswith("Bearer "):
+            token = bearer[7:]
+            host = os.environ.get("DATABRICKS_HOST", "")
+            if not host.startswith("http"):
+                host = f"https://{host}"
+            # Switch MLflow tracking from 'databricks' scheme to direct HTTPS+token.
+            # This uses RestStore (simple token auth) instead of DatabricksTracingRestStore
+            # which has a complex credential resolution that fails in Apps.
+            os.environ["MLFLOW_TRACKING_URI"] = host
+            os.environ["MLFLOW_TRACKING_TOKEN"] = token
+            mlflow.set_tracking_uri(host)
+    except Exception as e:
+        print(f"Warning: Could not configure MLflow tracking URI: {e}")
 
-    # Try to load from workspace secrets (for notebook runs)
-    if dbutils:
-        try:
-            client_id = dbutils.secrets.get(scope=SECRET_SCOPE_NAME, key=CLIENT_ID_KEY)
-            client_secret = dbutils.secrets.get(scope=SECRET_SCOPE_NAME, key=CLIENT_SECRET_KEY)
-            os.environ["DATABRICKS_CLIENT_ID"] = client_id.strip()
-            os.environ["DATABRICKS_CLIENT_SECRET"] = client_secret.strip()
-            return WorkspaceClient(
-                host=os.environ.get("DATABRICKS_HOST"),
-                client_id=client_id.strip(),
-                client_secret=client_secret.strip(),
-            )
-        except Exception as e:
-            print(f"Warning: Could not load secrets from scope '{SECRET_SCOPE_NAME}': {e}")
-
-    # Fall back to default authentication (will use ~/.databrickscfg or environment)
-    return WorkspaceClient()
+    return w
 
 WORKSPACE_CLIENT = setup_authentication()
 
 # Configure MLflow to use Unity Catalog registry
-# This ensures MLflow's internal client uses the correct registry and authentication
 mlflow.set_registry_uri("databricks-uc")
 
 ############################################
